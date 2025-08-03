@@ -1,0 +1,174 @@
+#include <SPI.h>
+#include <mcp2515.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <time.h>
+
+// WiFi Configuration
+const char* ssid = "Apex";
+const char* password = "12345678";
+
+// Firebase Configuration
+const char* firebaseHost = "batteryh-48785.firebaseapp.com";
+const char* firebasePath = "/batteryData";
+const char* firebaseAuth = "AIzaSyBJijwZT4NFFyi_DMVLIqOoW2kpkvj6Ig4";
+
+// Create MCP2515 object with SPI CS pin
+struct can_frame canMsg;
+MCP2515 mcp2515(5);  // CS pin connected to GPIO5
+
+// Variables to store incoming values
+float batteryVoltage = 0.0;
+float batteryCurrent = 0.0;
+float batteryPower = 0.0;
+float batteryTemperature = 0.0;
+float batterySOC = 0.0;
+float batterySOH = 0.0;
+uint8_t batteryStatus = 0;
+
+// Timer for data sending
+unsigned long lastSendTime = 0;
+const unsigned long sendInterval = 5000; // Send every 5 seconds
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Initialize SPI
+  SPI.begin();
+  
+  // Initialize CAN bus
+  mcp2515.reset();
+  mcp2515.setBitrate(CAN_500KBPS, MCP_8MHZ);
+  mcp2515.setNormalMode();
+  
+  // Connect to WiFi
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  
+  Serial.println("\nConnected to WiFi");
+  Serial.println("IP address: " + WiFi.localIP().toString());
+  
+  // Initialize time (needed for HTTPS)
+  configTime(0, 0, "pool.ntp.org");
+  
+  Serial.println("ESP32 CAN Receiver Initialized");
+}
+
+void loop() {
+  if (mcp2515.readMessage(&canMsg) == MCP2515::ERROR_OK) {
+    if (canMsg.can_id == 0x110) {
+      // Voltage, Current, Power
+      uint16_t voltageRaw = (canMsg.data[0] << 8) | canMsg.data[1];
+      int16_t currentRaw = (canMsg.data[2] << 8) | canMsg.data[3]; 
+      int16_t powerRaw = (canMsg.data[4] << 8) | canMsg.data[5];
+      batteryStatus = canMsg.data[6];
+
+      batteryVoltage = voltageRaw / 100.0;
+      batteryCurrent = currentRaw/1.0 ;
+      batteryPower = powerRaw / 1.0;
+    }
+    else if (canMsg.can_id == 0x111) {
+      // Temperature, SOC, SOH
+      int16_t tempRaw = (canMsg.data[0] << 8) | canMsg.data[1];
+      uint16_t socRaw = (canMsg.data[2] << 8) | canMsg.data[3];
+      uint16_t sohRaw = (canMsg.data[4] << 8) | canMsg.data[5];
+      batteryStatus = canMsg.data[6];
+
+      batteryTemperature = tempRaw / 10.0;
+      batterySOC = socRaw / 10.0;
+      batterySOH = sohRaw / 10.0;
+
+      // Display data locally
+      printBatteryData();
+      
+      // Send data to Firebase if interval has passed
+      if (millis() - lastSendTime >= sendInterval) {
+        sendToFirebase();
+        lastSendTime = millis();
+      }
+    }
+  }
+}
+
+void sendToFirebase() {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    
+    // Get current time
+    struct tm timeinfo;
+    if(!getLocalTime(&timeinfo)) {
+      Serial.println("Failed to obtain time");
+      return;
+    }
+    
+    char timestamp[30];
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
+
+    StaticJsonDocument<512> doc;
+
+    // Create a new document with proper timestamp format
+    doc["fields"]["timestamp"]["timestampValue"] = timestamp;
+    doc["fields"]["voltage"]["doubleValue"] = batteryVoltage;
+    doc["fields"]["current"]["doubleValue"] = batteryCurrent;
+    doc["fields"]["power"]["doubleValue"] = batteryPower;
+    doc["fields"]["temperature"]["doubleValue"] = batteryTemperature;
+    doc["fields"]["soc"]["doubleValue"] = batterySOC;
+    doc["fields"]["soh"]["doubleValue"] = batterySOH;
+    doc["fields"]["status"]["stringValue"] = getStatusMessage(batteryStatus);
+
+    String jsonString;
+    serializeJson(doc, jsonString);
+
+    // Create a new document instead of updating existing one
+    String url = "https://firestore.googleapis.com/v1/projects/batteryh-4a25c/databases/(default)/documents/batteryData?key=" + String(firebaseAuth);
+
+    http.begin(url);
+    http.addHeader("Content-Type", "application/json");
+
+    // Use POST to create a new document
+    int httpResponseCode = http.POST(jsonString);
+
+    if (httpResponseCode > 0) {
+      String response = http.getString();
+      Serial.println("Firebase Response Code: " + String(httpResponseCode));
+      Serial.println("Response: " + response);
+    } else {
+      Serial.println("Error sending data to Firebase");
+      Serial.println("Error code: " + String(httpResponseCode));
+    }
+
+    http.end();
+  } else {
+    Serial.println("WiFi Disconnected");
+    WiFi.begin(ssid, password);
+  }
+}
+
+void printBatteryData() {
+  Serial.println("---- Battery Status ----");
+  Serial.print("Voltage: "); Serial.print(batteryVoltage); Serial.println(" mV");
+  Serial.print("Current: "); Serial.print(batteryCurrent); Serial.println(" mA");
+  Serial.print("Power  : "); Serial.print(batteryPower); Serial.println(" W");
+  Serial.print("Temp   : "); Serial.print(batteryTemperature); Serial.println(" °C");
+  Serial.print("SOC    : "); Serial.print(batterySOC); Serial.println(" %");
+  Serial.print("SOH    : "); Serial.print(batterySOH); Serial.println(" %");
+  Serial.print("Status : "); Serial.println(getStatusMessage(batteryStatus));
+  Serial.println("------------------------\n");
+}
+
+String getStatusMessage(uint8_t status) {
+  switch (status) {
+    case 0: return "Normal";
+    case 1: return "Over-voltage";
+    case 2: return "Under-voltage";
+    case 3: return "Over-current";
+    case 4: return "Over-temp";
+    default: return "Unknown";
+  }
+}
