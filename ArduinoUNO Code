@@ -1,0 +1,144 @@
+/**
+ * Arduino UNO 1 - Li-ion Battery Monitor (Staggered CAN Timing)
+ * 
+ * Staggers CAN sends by 250 ms so UNO 2 can interleave.
+ */
+
+#include <Wire.h>
+#include <Adafruit_INA219.h>
+#include <SPI.h>
+#include <mcp2515.h>
+
+// Pins
+#define CAN_CS_PIN        10
+#define TEMP_SENSOR_PIN   A0
+
+// Battery params
+#define BATTERY_MIN_VOLTAGE 3.0
+#define BATTERY_MAX_VOLTAGE 4.2
+#define BATTERY_CAPACITY    2000.0
+
+// Temp params
+#define TEMP_MIN_SAFE      0.0
+#define TEMP_MAX_SAFE      45.0
+#define NTC_SERIES_RESISTOR   10000
+#define NTC_NOMINAL_RESISTANCE 10000
+#define NTC_NOMINAL_TEMPERATURE 25.0
+#define NTC_BETA            3950
+
+// CAN IDs
+#define CAN_ID_BATTERY1_BASIC     0x201
+#define CAN_ID_BATTERY1_ADVANCED  0x202
+
+// Timing
+#define SAMPLING_INTERVAL   1000
+#define CAN_SEND_INTERVAL    500
+
+Adafruit_INA219 ina219;
+MCP2515 mcp2515(CAN_CS_PIN);
+struct can_frame canMsg;
+
+float batteryVoltage, batteryCurrent, batteryPower;
+float batteryTemperature, batterySOC=100, batterySOH=100, batteryConsumed=0;
+byte batteryStatus=0;
+const byte BATTERY_ID = 1;
+
+unsigned long lastSampleTime=0, lastCanSendTime=0;
+
+void setup(){
+  Serial.begin(115200);
+  Wire.begin();
+  if(!ina219.begin()){ while(1); }
+  ina219.setCalibration_32V_2A();
+  SPI.begin();
+  mcp2515.reset();
+  mcp2515.setBitrate(CAN_500KBPS, MCP_8MHZ);
+  mcp2515.setNormalMode();
+  pinMode(TEMP_SENSOR_PIN, INPUT);
+  canMsg.can_dlc = 8;
+  // **Phase shift** by half-interval (250 ms)
+  delay(CAN_SEND_INTERVAL/2);
+}
+
+void loop(){
+  unsigned long now = millis();
+  if(now - lastSampleTime >= SAMPLING_INTERVAL){
+    lastSampleTime = now;
+    readBatteryData();
+    calculateSOC(now);
+    calculateSOH();
+    evaluateStatus();
+    printBatteryData();
+  }
+  if(now - lastCanSendTime >= CAN_SEND_INTERVAL){
+    lastCanSendTime = now;
+    // Maintain the 250 ms offset every cycle
+    delay(CAN_SEND_INTERVAL/2);
+    sendDataViaCan();
+  }
+}
+
+void readBatteryData(){
+  batteryVoltage = ina219.getBusVoltage_V();
+  batteryCurrent = ina219.getCurrent_mA();
+  batteryPower   = ina219.getPower_mW();
+  batteryTemperature = readNTCTemperature();
+}
+
+float readNTCTemperature(){
+  int raw = analogRead(TEMP_SENSOR_PIN);
+  float R = (1023.0/raw - 1)*NTC_SERIES_RESISTOR;
+  float steinhart = log(R/NTC_NOMINAL_RESISTANCE);
+  steinhart = 1.0/(1.0/(NTC_NOMINAL_TEMPERATURE+273.15)+steinhart/NTC_BETA);
+  return steinhart - 273.15;
+}
+
+void calculateSOC(unsigned long now){
+  float hrs = (now - lastSampleTime)/3600000.0;
+  batteryConsumed += batteryCurrent*hrs;
+  batterySOC = constrain(100.0*(1.0 - batteryConsumed/BATTERY_CAPACITY), 0.0, 100.0);
+}
+
+void calculateSOH(){
+  batterySOH = 100.0; // placeholder
+}
+
+void evaluateStatus(){
+  if(batteryVoltage < BATTERY_MIN_VOLTAGE || batteryTemperature> TEMP_MAX_SAFE
+     || batteryTemperature<TEMP_MIN_SAFE || batterySOC<5.0) batteryStatus=2;
+  else if(batteryVoltage < BATTERY_MIN_VOLTAGE+0.2 || batterySOC<15.0
+     || batteryTemperature> TEMP_MAX_SAFE-5.0 || batterySOH<70.0) batteryStatus=1;
+  else batteryStatus=0;
+}
+
+void printBatteryData(){
+  Serial.print("Voltage: "); Serial.print(batteryVoltage); Serial.print(" V  ");
+  Serial.print("Current: "); Serial.print(batteryCurrent); Serial.print(" mA  ");
+  Serial.print("Temp: "); Serial.print(batteryTemperature); Serial.println(" °C");
+}
+
+void sendDataViaCan(){
+  // Basic
+  canMsg.can_id = CAN_ID_BATTERY1_BASIC;
+  canMsg.data[0] = BATTERY_ID;
+  uint16_t v = batteryVoltage*100;
+  canMsg.data[1]=(v>>8); canMsg.data[2]=v&0xFF;
+  int16_t c = batteryCurrent;
+  canMsg.data[3]=(c>>8); canMsg.data[4]=c&0xFF;
+  uint16_t p = batteryPower;
+  canMsg.data[5]=(p>>8); canMsg.data[6]=p&0xFF;
+  canMsg.data[7]=batteryStatus;
+  mcp2515.sendMessage(&canMsg);
+  delay(5);
+  // Advanced
+  canMsg.can_id = CAN_ID_BATTERY1_ADVANCED;
+  canMsg.data[0] = BATTERY_ID;
+  int16_t t = batteryTemperature*10;
+  canMsg.data[1]=(t>>8); canMsg.data[2]=t&0xFF;
+  uint16_t s = batterySOC*10;
+  canMsg.data[3]=(s>>8); canMsg.data[4]=s&0xFF;
+  uint16_t h = batterySOH*10;
+  canMsg.data[5]=(h>>8); canMsg.data[6]=h&0xFF;
+  canMsg.data[7]=0;
+  mcp2515.sendMessage(&canMsg);
+}
