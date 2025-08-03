@@ -6,13 +6,13 @@
 #include <time.h>
 
 // WiFi Configuration
-const char* ssid = "Apex";
-const char* password = "12345678";
+const char* ssid = "Wifi name";
+const char* password = "Wifi Password";
 
 // Firebase Configuration
-const char* firebaseHost = "batteryh-48785.firebaseapp.com";
-const char* firebasePath = "/batteryData";
-const char* firebaseAuth = "AIzaSyBJijwZT4NFFyi_DMVLIqOoW2kpkvj6Ig4";
+const char* firebaseHost = "Enter Host ID";
+const char* firebasePath = "Enter Path";
+const char* firebaseAuth = "Your Auth code";
 
 // Create MCP2515 object with SPI CS pin
 struct can_frame canMsg;
@@ -126,7 +126,7 @@ void sendToFirebase() {
     serializeJson(doc, jsonString);
 
     // Create a new document instead of updating existing one
-    String url = "https://firestore.googleapis.com/v1/projects/batteryh-4a25c/databases/(default)/documents/batteryData?key=" + String(firebaseAuth);
+    String url = "Enter Firebase URL here" + String(firebaseAuth);
 
     http.begin(url);
     http.addHeader("Content-Type", "application/json");
